@@ -94,6 +94,19 @@ Profile {
 }
 ```
 
+#### Batch issuer registration
+
+`batch_register_issuers` accepts issuer addresses with metadata maps and stores
+each supplied map on its newly created profile. All maps are validated before
+registration: each may contain at most 20 entries, with nonempty keys and
+values, keys no longer than 64 characters, and values no longer than 512
+characters. A batch may contain at most 50 entries.
+
+Addresses already registered are skipped. If an address is repeated within a
+batch, its first occurrence is registered and subsequent occurrences are
+skipped. The returned `Vec<Address>` contains skipped addresses in input
+order. Invalid metadata rejects the batch before any profiles are created.
+
 #### Profile Flags
 
 `packed_flags` is a `u32` bitmask that encodes three boolean values. The bit
