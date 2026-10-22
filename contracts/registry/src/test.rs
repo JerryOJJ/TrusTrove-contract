@@ -3,8 +3,8 @@
 extern crate std;
 
 use crate::{
-    DataKey, Profile, RegistryContract, RegistryContractClient, Role, VerificationStatus,
-    TTL_EXTEND_TO, TTL_THRESHOLD,
+    DataKey, Profile, RegistryContract, RegistryContractClient, RegistryError, Role,
+    VerificationStatus, TTL_EXTEND_TO, TTL_THRESHOLD,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestRunner};
@@ -602,133 +602,81 @@ fn test_duplicate_registration_panics() {
 // ============== CROSS-ROLE REGISTRATION GUARD (Issue #189) ==============
 
 #[test]
-#[should_panic(expected = "Error(Contract, #2)")]
-fn test_register_issuer_then_buyer_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, RegistryContract);
-    let client = RegistryContractClient::new(&env, &contract_id);
-
+fn test_register_issuer_then_buyer_preserves_issuer_profile() {
+    let (env, client) = setup();
     let admin = Address::generate(&env);
     let issuer = Address::generate(&env);
-    let metadata = map![&env];
-
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &admin,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "initialize",
-            args: (admin.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
+    let original_metadata = map![
+        &env,
+        (
+            String::from_str(&env, "name"),
+            String::from_str(&env, "Original issuer")
+        )
+    ];
+    let attempted_metadata = map![
+        &env,
+        (
+            String::from_str(&env, "name"),
+            String::from_str(&env, "Buyer attempt")
+        )
+    ];
     client.initialize(&admin);
 
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &issuer,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "register_issuer",
-            args: (issuer.clone(), metadata.clone()).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    client.register_issuer(&issuer, &metadata);
+    env.ledger().set_timestamp(100);
+    client.register_issuer(&issuer, &original_metadata);
+    let before = client.get_profile(&issuer);
+    assert_eq!(before.registered_at, 100);
 
-    assert!(!client.is_verified(&issuer));
-    assert_eq!(client.get_profile(&issuer).role(), Role::Issuer);
-
+    env.ledger().set_timestamp(200);
     assert_eq!(
-        env.events().all(),
-        vec![
-            &env,
-            (
-                client.address.clone(),
-                (Symbol::new(&env, "contract_initialized"), admin.clone()).into_val(&env),
-                ().into_val(&env),
-            ),
-            (
-                client.address.clone(),
-                (Symbol::new(&env, "issuer_registered"), issuer.clone()).into_val(&env),
-                ().into_val(&env),
-            ),
-        ]
+        client.try_register_buyer(&issuer, &attempted_metadata),
+        Err(Ok(RegistryError::AlreadyRegistered.into()))
     );
 
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &issuer,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "register_buyer",
-            args: (issuer.clone(), metadata.clone()).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    client.register_buyer(&issuer, &metadata);
+    let after = client.get_profile(&issuer);
+    assert_eq!(after.role(), Role::Issuer);
+    assert_eq!(after.packed_flags, before.packed_flags);
+    assert_eq!(after.metadata, before.metadata);
+    assert_eq!(after.registered_at, before.registered_at);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #2)")]
-fn test_register_buyer_then_issuer_panics() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, RegistryContract);
-    let client = RegistryContractClient::new(&env, &contract_id);
-
+fn test_register_buyer_then_issuer_preserves_buyer_profile() {
+    let (env, client) = setup();
     let admin = Address::generate(&env);
     let buyer = Address::generate(&env);
-    let metadata = map![&env];
-
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &admin,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "initialize",
-            args: (admin.clone(),).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
+    let original_metadata = map![
+        &env,
+        (
+            String::from_str(&env, "name"),
+            String::from_str(&env, "Original buyer")
+        )
+    ];
+    let attempted_metadata = map![
+        &env,
+        (
+            String::from_str(&env, "name"),
+            String::from_str(&env, "Issuer attempt")
+        )
+    ];
     client.initialize(&admin);
 
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &buyer,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "register_buyer",
-            args: (buyer.clone(), metadata.clone()).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    client.register_buyer(&buyer, &metadata);
+    env.ledger().set_timestamp(100);
+    client.register_buyer(&buyer, &original_metadata);
+    let before = client.get_profile(&buyer);
+    assert_eq!(before.registered_at, 100);
 
-    assert!(!client.is_verified(&buyer));
-    assert_eq!(client.get_profile(&buyer).role(), Role::Buyer);
-
+    env.ledger().set_timestamp(200);
     assert_eq!(
-        env.events().all(),
-        vec![
-            &env,
-            (
-                client.address.clone(),
-                (Symbol::new(&env, "contract_initialized"), admin.clone()).into_val(&env),
-                ().into_val(&env),
-            ),
-            (
-                client.address.clone(),
-                (Symbol::new(&env, "buyer_registered"), buyer.clone()).into_val(&env),
-                ().into_val(&env),
-            ),
-        ]
+        client.try_register_issuer(&buyer, &attempted_metadata),
+        Err(Ok(RegistryError::AlreadyRegistered.into()))
     );
 
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &buyer,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "register_issuer",
-            args: (buyer.clone(), metadata.clone()).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    client.register_issuer(&buyer, &metadata);
+    let after = client.get_profile(&buyer);
+    assert_eq!(after.role(), Role::Buyer);
+    assert_eq!(after.packed_flags, before.packed_flags);
+    assert_eq!(after.metadata, before.metadata);
+    assert_eq!(after.registered_at, before.registered_at);
 }
 
 #[test]
