@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, map, panic_with_error, Address, BytesN, Env, Map, String, Vec,
+    contract, contractimpl, panic_with_error, Address, BytesN, Env, Map, String, Vec,
 };
 use trusttrove_pause::{require_not_paused, set_paused};
 
@@ -34,7 +34,11 @@ pub struct RegistryContract;
 
 #[contractimpl]
 impl RegistryContract {
-    /// Initializes the registry contract and stores the admin address.
+    /// Constructs the registry contract and stores the admin address.
+    ///
+    /// Runs atomically at deploy time (Soroban protocol constructor, #827):
+    /// there is no window in which the instance exists without a stored
+    /// admin, so no one can front-run initialization and claim ownership.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -42,25 +46,25 @@ impl RegistryContract {
     ///
     /// # Auth
     /// * Requires `admin.require_auth()` — the incoming admin must sign the
-    ///   initialization call so ownership cannot be assigned to an address
+    ///   deployment so ownership cannot be assigned to an address
     ///   the caller does not control.
     ///
     /// # Panics
-    /// * `RegistryError::AlreadyInitialized` if the contract has already been
-    ///   initialized (an admin is already stored under `DataKey::Admin`).
+    /// * Any panic aborts the deployment transaction atomically, so a
+    ///   registry that ends up on-chain is always fully constructed.
+    ///   (`RegistryError::AlreadyInitialized` is unreachable from this
+    ///   entry point and kept only for error-code stability.)
     ///
     /// # Returns
     /// * `()` - No value is returned.
     ///
     /// # Example
     /// ```ignore
-    /// client.initialize(&admin);
+    /// // Deploy-and-construct in a single operation:
+    /// // env.register(RegistryContract, (admin,))
     /// ```
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn __constructor(env: Env, admin: Address) {
         require_not_paused(&env);
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, RegistryError::AlreadyInitialized);
-        }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         events::contract_initialized(&env, &admin);
@@ -175,7 +179,7 @@ impl RegistryContract {
         let mut skipped: Vec<Address> = Vec::new(&env);
         let mut registered: u32 = 0;
         for entry in entries.iter() {
-            let (address, _metadata) = entry;
+            let (address, metadata) = entry;
             let key = DataKey::Profile(address.clone());
             if env.storage().persistent().has(&key) {
                 skipped.push_back(address.clone());
@@ -183,7 +187,7 @@ impl RegistryContract {
             }
 
             // #130: new profiles start unverified; admin must verify via verify_profile.
-            let profile = Profile::new(Role::Issuer, false, env.ledger().timestamp(), map![&env]);
+            let profile = Profile::new(Role::Issuer, false, env.ledger().timestamp(), metadata);
 
             env.storage().persistent().set(&key, &profile);
             env.storage()
@@ -504,15 +508,21 @@ impl RegistryContract {
     }
 
     pub fn get_verification_status(env: Env, address: Address) -> VerificationStatus {
-        match env
-            .storage()
-            .persistent()
-            .get::<_, Profile>(&DataKey::Profile(address))
-        {
+        let key = DataKey::Profile(address);
+        match env.storage().persistent().get::<_, Profile>(&key) {
             None => VerificationStatus::Unregistered,
-            Some(p) if p.verified() => VerificationStatus::Verified,
-            Some(p) if p.revoked() => VerificationStatus::Revoked,
-            Some(_) => VerificationStatus::Pending,
+            Some(profile) => {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+                if profile.verified() {
+                    VerificationStatus::Verified
+                } else if profile.revoked() {
+                    VerificationStatus::Revoked
+                } else {
+                    VerificationStatus::Pending
+                }
+            }
         }
     }
 
@@ -689,9 +699,10 @@ impl RegistryContract {
 
     /// Revokes a registered profile by setting its verification status to `false`.
     ///
-    /// This function is idempotent: calling it on an already-revoked profile
+    /// This function is idempotent: calling it on an already-unverified profile
     /// returns `true` without re-emitting the `address_revoked` event or
-    /// rewriting storage.
+    /// rewriting storage. The instance and profile TTLs are still extended so
+    /// repeated administrative reads cannot let the registry singleton age out.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment.
@@ -721,7 +732,13 @@ impl RegistryContract {
             .persistent()
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::NotFound));
-        if !profile.verified() {
+        if profile.revoked() {
+            // Only an already revoked profile is idempotent; Pending must transition.
+            // Extend TTLs so repeated admin reads don't let storage age out.
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+            Self::extend_instance_ttl(&env);
             return true;
         }
         profile.set_verified(false);
